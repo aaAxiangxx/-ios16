@@ -11,9 +11,16 @@
 | --- | --- |
 | 主 App 部署目标 | iOS **16.2** |
 | Widget Extension 部署目标 | iOS **16.2** |
-| Watch App / File Provider / Push 扩展 | **保持 17.0 不动**（本次适配范围外） |
+| File Provider 扩展 / Push 通知扩展 | iOS **16.2**（必须与主 App 对齐，见下方说明） |
+| Watch App / Watch Extension | **保持 watchOS 10.6 不动**（watchOS 独立版本线，与 iOS 部署目标无关） |
 | 为什么是 16.2 而不是 16.0 / 16.1 | Live Activity 用的 `ActivityContent` 自 **iOS 16.2** 引入。锁 16.1 需要重写 tail Live Activity 的更新链路并放弃 `staleDate`，收益不抵成本 |
 | 验收标准 | 保功能，视觉可降级 —— 以「iOS 16 上能正常启动并使用」为准，不追求像素级还原 iOS 17 观感 |
+
+> **关于扩展必须一起降的原因**：Apple 要求 App Extension 的 `IPHONEOS_DEPLOYMENT_TARGET`
+> **不得低于其宿主 App**。若主 App 是 16.2 而扩展是 17.0，Xcode 构建时能过，
+> 但产出的 `.app` 装到 iOS 16 设备上会因扩展要求更高系统版本而**无法安装 / 启动即崩**，
+> 上架 App Store Connect 也会被校验拒绝。所以「Orange Cloud File」与「notification」
+> 两个 target 必须同步降到 16.2 —— 它们是 iOS 侧扩展，与 Watch 那条独立版本线无关。
 
 改造范围：**主 App + Widget（含 Live Activity）** 共 403 个 Swift 文件，其中实际改动 66 个文件、新增 5 个文件、删除 2 个文件。
 
@@ -226,14 +233,31 @@ Debug / Release 两份 `SWIFT_ACTIVE_COMPILATION_CONDITIONS`。
 
 ## 七、必须人工核查的清单
 
-> ⚠️ **本次改动全部未经编译验证。** 改造环境是 Linux 沙箱，没有 macOS / Xcode / iOS SDK，
-> 无法运行 `xcodebuild`。以下清单请在 macOS 上逐项过一遍。
+> ⚠️ **本次改动未经真正的 `xcodebuild` 编译验证。** 改造环境是 Linux 沙箱，没有 macOS / Xcode / iOS SDK。
+> 已完成的替代验证见 §6.5；以下清单请在 macOS 上逐项过一遍。
+
+### 7.0 已完成的替代验证（Linux 上可做的部分）
+
+| 验证项 | 方法 | 结论 |
+| --- | --- | --- |
+| 语法正确性 | Swift 6.4.1 Linux 工具链 `swift-frontend -frontend -parse`，对 403 个 .swift 文件分别按 **iOS 17 分支**与 **iOS 16 分支**各跑一遍 | ✅ 806 次解析全部通过，无语法错误 |
+| 条件编译对称性 | 同上，两个分支都必须能独立解析（防止 `#if` / `#endif` 配对错位） | ✅ 通过 |
+| iOS 17 专属 API 残留 | 全量 grep 12 类关键词，逐条回溯判定是真实调用还是文档注释 | ✅ 无真实残留（命中项全在注释或条件编译内） |
+| pbxproj 结构完整性 | 改后统计 `{}/()`/`/* */` 配对与 diff 逐行复核 | ✅ 平衡，diff 精确 6 行 |
+| 扩展 target 依赖 | 扫描 `Orange Cloud File` 与 `notification` 的 iOS 17 API 与协议方法 | ✅ 零依赖，无需改代码 |
+
+> 关于「分支扫描」：`#if __IPHONE_OS_VERSION_MIN_REQUIRED >= 170000` 在 Linux 上是未定义标识符，
+> 且 `-parse` 模式不支持 `#if` 里的算术比较（`#if 1 >= 1` 本身就会报错），
+> 所以扫描时把该表达式替换成 `true` / `false` 字面量。两种分支都要能解析，才能覆盖到两套 Widget 代码。
 
 ### 7.1 第一优先：编译
 
 - [ ] `xcodebuild -scheme "Orange Cloud" -destination 'generic/platform=iOS' build`
       重点看是否报「找不到 `ContentUnavailableView` / `MapCameraPosition` / `WidgetConfigurationIntent`」
 - [ ] `xcodebuild -scheme OrangeCloudWidgetsExtension -destination 'generic/platform=iOS' build`
+- [ ] `xcodebuild -scheme "Orange Cloud File" -destination 'generic/platform=iOS' build`
+- [ ] `xcodebuild -scheme notification -destination 'generic/platform=iOS' build`
+      （这两个扩展随主 App 一起打包，签名或部署目标出问题会连带装不上）
 - [ ] 用 iOS 16.2 或 16.7 真机 / 模拟器实跑，确认启动不崩
 
 ### 7.2 第二优先：静默失效（编译通过但行为错）
@@ -269,16 +293,23 @@ Debug / Release 两份 `SWIFT_ACTIVE_COMPILATION_CONDITIONS`。
 
 ## 八、涉及的部署目标改动（project.pbxproj）
 
-改动 4 处 `IPHONEOS_DEPLOYMENT_TARGET`：`17.0` → `16.2`
+改动 **10 处** `IPHONEOS_DEPLOYMENT_TARGET`：`17.0` → `16.2`
 
-| 行号（改前） | target | 处理 |
+| 行号 | target | 处理 |
 | --- | --- | --- |
 | 656 / 688 | OrangeCloudWidgetsExtension Debug / Release | ✅ 改为 16.2 |
-| 987 / 1032 | Orange Cloud（主 App）Debug / Release | ✅ 改为 16.2 |
-| 855 / 885 | File（文件 App 扩展） | ⬜ 不动（范围外） |
-| 915 / 945 | notification（推送扩展） | ⬜ 不动（范围外） |
-| 1108 / 1168 | PBXProject 级 | ⬜ 不动 |
-| 4 处 | watchOS（`WATCHOS_DEPLOYMENT_TARGET = 10.6`） | ⬜ 不动 |
+| 987 / 1033 | Orange Cloud（主 App）Debug / Release | ✅ 改为 16.2 |
+| 855 / 885 | Orange Cloud File（文件 App 扩展）Debug / Release | ✅ 改为 16.2（**必须对齐宿主 App**） |
+| 915 / 945 | notification（推送扩展）Debug / Release | ✅ 改为 16.2（**必须对齐宿主 App**） |
+| 1110 / 1170 | PBXProject 级默认 | ✅ 改为 16.2（避免将来新增 target 误继承 17.0） |
+| 738 / 772 / 806 / 840 | watchOS（`WATCHOS_DEPLOYMENT_TARGET = 10.6`） | ⬜ 不动（watchOS 独立版本线） |
+
+最终 4 个 iOS target（主 App / Widget / File 扩展 / Push 扩展）部署目标全部为 `16.2`，无 17.0 残留。
+
+两个扩展的源码已确认**零 iOS 17 依赖**：不含 SwiftData、Observation、`ContentUnavailableView`、
+`sensoryFeedback`、`symbolEffect`、AppIntents；`Orange Cloud File` 用到的
+`NSFileProviderExtension` / `NSFileProviderEnumerator` 全部方法在 iOS 16 已存在，
+因此无需为降级改动任何代码。
 
 另在主 App 两份配置新增自定义编译条件（用于隔离 MapKit SwiftUI）：
 
