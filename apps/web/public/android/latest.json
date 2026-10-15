@@ -1,0 +1,7 @@
+{
+  "versionCode": 28,
+  "versionName": "2.2.0",
+  "minVersionCode": 1,
+  "url": "https://o-c.do/orange-cloud.apk",
+  "note": "本次更新：AI 爬虫按 AI 搜索、AI 助手与 Agent、AI 训练分别管控，新增会话级机器人检测；Workers 问题汇总，可标记已解决或忽略；安全洞察一键扫描；流量分析新增访问明细与安全事件；缓存可标记过期，新增缓存响应规则；支持欧盟、美国数据驻留的 R2 与 KV；DNS 标出被遮蔽的记录；可搜索新域名；编辑 DNS 记录时不再能改类型。"
+}

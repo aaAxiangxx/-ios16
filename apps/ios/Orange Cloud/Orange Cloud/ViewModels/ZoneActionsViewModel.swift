@@ -1,0 +1,396 @@
+//
+//  ZoneActionsViewModel.swift
+//  Orange Cloud
+//
+//  Zone 详情页「操作」区：Under Attack / 开发模式 / 暂停 Cloudflare 开关 + 缓存清理 / 标记过期，
+//  以及「AI 内容控制」区：AI 训练重定向 / 面向 Agent 的 Markdown。
+//
+//  注意暂停态与另两个开关的数据源不同：Under Attack / 开发模式读写 zone settings
+//  （zone-settings.read/.write），暂停读写 zone 本身（zone.read / zone.write），
+//  两条链路的权限与加载态各自独立，别合并。
+//
+
+import Foundation
+import SwiftUI   // ObservableObject（iOS 16 基线：@Observable 是 iOS 17+）
+
+@MainActor
+final class ZoneActionsViewModel: ObservableObject {
+
+    @Published
+    private(set) var underAttack = false
+    @Published
+    private(set) var devMode = false
+    @Published
+    private(set) var settingsLoaded = false
+    /// 是否暂停 Cloudflare 代理。初值取自本地缓存，进页后再用 API 校准。
+    @Published
+    private(set) var paused: Bool
+
+    // MARK: AI 内容控制（Pro 起；免费套餐读得到但不可改，对应开关隐藏）
+
+    /// Redirects for AI Training —— 把 AI 训练类爬虫重定向走
+    @Published
+    private(set) var aiTrainingRedirect = false
+    /// Markdown for Agents —— 按 Accept: text/markdown 把 HTML 转 Markdown 供 agent 消费
+    @Published
+    private(set) var markdownForAgents = false
+    /// 上面两项各自读到且可改才显示
+    @Published
+    private(set) var aiTrainingRedirectAvailable = false
+    @Published
+    private(set) var markdownForAgentsAvailable = false
+    var aiSettingsAvailable: Bool { aiTrainingRedirectAvailable || markdownForAgentsAvailable }
+
+    // MARK: 机器人管控（bot-management.read/.write，全套餐可用）
+
+    /// AI 爬虫处置：全站拦 / 仅广告页 / 放行
+    @Published
+    private(set) var aiBotsProtection: AIBotsProtection = .disabled
+    /// 链接迷宫（AI Labyrinth）
+    @Published
+    private(set) var crawlerProtection = false
+    /// 拦内容机器人
+    @Published
+    private(set) var contentBotsProtection = false
+    /// Robots 访问控制许可证
+    @Published
+    private(set) var robotsLicense = false
+    /// 托管 robots.txt
+    @Published
+    private(set) var managedRobotsTxt = false
+    @Published
+    private(set) var botConfigLoaded = false
+
+    // 2026-09 拆分后的三项 AI 爬虫策略（原始取值，未知档位原样保留）。
+    // 响应带任一项即 usesAICrawlerPolicies，UI 用三个选择行替换旧「AI 爬虫」。
+    @Published
+    private(set) var aiSearch: String?
+    @Published
+    private(set) var aiUser: String?
+    @Published
+    private(set) var aiTraining: String?
+    @Published
+    private(set) var usesAICrawlerPolicies = false
+    /// Bot Preference Sync（按偏好生成 robots.txt）；nil = 响应未带该字段，UI 回退旧「托管 robots.txt」
+    @Published
+    private(set) var botPreferenceSync: Bool?
+
+    // MARK: 会话级机器人检测（Precursor，precursor.read/.write）
+
+    /// default_mode 原始取值；nil = 未加载 / 读取失败（行整体隐藏）
+    @Published
+    private(set) var precursorMode: String?
+    @Published
+    var isUpdatingPrecursor = false
+
+    @Published
+    var isTogglingUnderAttack = false
+    @Published
+    var isTogglingDevMode = false
+    @Published
+    var isTogglingAITrainingRedirect = false
+    @Published
+    var isTogglingMarkdownForAgents = false
+    /// 机器人管控五项共用一个忙态：同一个端点，串行改更安全
+    @Published
+    var isUpdatingBotConfig = false
+    @Published
+    var isTogglingPause = false
+    @Published
+    var isPurging = false
+    @Published
+    var didPurge = false       // sensoryFeedback / 提示触发器
+    @Published
+    var didInvalidate = false  // 「已标记为过期」提示触发器
+    @Published
+    var error: String?
+
+    private let service: ZoneSettingsService
+    private let zoneService: ZoneService
+    private let botService: BotManagementService
+    private let precursorService: PrecursorService
+    private let zoneId: String
+
+    init(
+        service: ZoneSettingsService,
+        zoneService: ZoneService,
+        botService: BotManagementService,
+        precursorService: PrecursorService,
+        zoneId: String,
+        paused: Bool = false
+    ) {
+        self.service = service
+        self.zoneService = zoneService
+        self.botService = botService
+        self.precursorService = precursorService
+        self.zoneId = zoneId
+        self.paused = paused
+    }
+
+    func loadSettings() async {
+        guard !settingsLoaded else { return }
+        async let securityTask = service.getSetting(zoneId: zoneId, setting: "security_level")
+        async let devTask = service.getSetting(zoneId: zoneId, setting: "development_mode")
+        // 读不到（无 zone-settings.read 等）就保持未加载态，开关显示为锁定
+        guard let security = try? await securityTask, let dev = try? await devTask else { return }
+        underAttack = security == "under_attack"
+        devMode = dev == "on"
+        settingsLoaded = true
+    }
+
+    /// 读 AI 内容控制两项。免费套餐也读得到值，只是 editable == false、一写就 400——
+    /// 读不到或不可改都当不支持，隐藏对应开关，不给用户一个永远打不开的锁。
+    func loadAISettings() async {
+        guard !aiSettingsAvailable else { return }
+        async let redirectTask = service.getSettingIfEditable(zoneId: zoneId, setting: "redirects_for_ai_training")
+        async let converterTask = service.getSettingIfEditable(zoneId: zoneId, setting: "content_converter")
+        let redirect = try? await redirectTask
+        let converter = try? await converterTask
+        aiTrainingRedirect = redirect == "on"
+        markdownForAgents = converter == "on"
+        aiTrainingRedirectAvailable = redirect != nil
+        markdownForAgentsAvailable = converter != nil
+    }
+
+    /// 读机器人管控配置。四种套餐形态共用 base_config，任何套餐都能读到。
+    func loadBotConfig() async {
+        guard !botConfigLoaded else { return }
+        guard let config = try? await botService.config(zoneId: zoneId) else { return }
+        apply(config)
+        botConfigLoaded = true
+    }
+
+    private func apply(_ config: BotManagementConfig) {
+        aiBotsProtection      = AIBotsProtection(apiValue: config.aiBotsProtection)
+        crawlerProtection     = config.crawlerProtection == "enabled"
+        contentBotsProtection = config.contentBotsProtection == "block"
+        robotsLicense         = config.cfRobotsVariant == "policy_only"
+        managedRobotsTxt      = config.isRobotsTxtManaged == true
+        aiSearch              = config.aiSearch
+        aiUser                = config.aiUser
+        aiTraining            = config.aiTraining
+        usesAICrawlerPolicies = config.hasAICrawlerPolicies
+        botPreferenceSync     = config.botPreferenceSyncEnabled
+    }
+
+    /// 写单个字段。PUT 是合并语义，只发改动的那一个，不会动 sbfm_* 等套餐专属配置。
+    private func updateBot<Value: Codable & Sendable>(
+        _ field: BotManagementField,
+        _ value: Value
+    ) async {
+        guard !isUpdatingBotConfig else { return }
+        isUpdatingBotConfig = true
+        error = nil
+        do {
+            apply(try await botService.update(zoneId: zoneId, field: field, value: value))
+        } catch {
+            self.error = error.localizedDescription
+        }
+        isUpdatingBotConfig = false
+    }
+
+    func setAIBotsProtection(_ mode: AIBotsProtection) async {
+        await updateBot(.aiBotsProtection, mode.rawValue)
+    }
+
+    func setCrawlerProtection(_ on: Bool) async {
+        await updateBot(.crawlerProtection, on ? "enabled" : "disabled")
+    }
+
+    func setContentBotsProtection(_ on: Bool) async {
+        await updateBot(.contentBotsProtection, on ? "block" : "disabled")
+    }
+
+    func setRobotsLicense(_ on: Bool) async {
+        await updateBot(.cfRobotsVariant, on ? "policy_only" : "off")
+    }
+
+    func setManagedRobotsTxt(_ on: Bool) async {
+        await updateBot(.isRobotsTxtManaged, on)
+    }
+
+    /// 读会话级机器人检测的默认模式。失败（字段已 deprecated、无该能力等）保持 nil，行隐藏。
+    func loadPrecursor() async {
+        guard precursorMode == nil else { return }
+        precursorMode = try? await precursorService.config(zoneId: zoneId).defaultMode ?? PrecursorMode.off.rawValue
+    }
+
+    func setPrecursorMode(_ mode: PrecursorMode) async {
+        guard !isUpdatingPrecursor else { return }
+        isUpdatingPrecursor = true
+        error = nil
+        do {
+            precursorMode = try await precursorService.setMode(zoneId: zoneId, mode: mode).defaultMode ?? mode.rawValue
+        } catch {
+            self.error = error.localizedDescription
+        }
+        isUpdatingPrecursor = false
+    }
+
+    func setAISearch(_ policy: AICrawlerPolicy) async {
+        await updateBot(.aiSearch, policy.rawValue)
+    }
+
+    func setAIUser(_ policy: AICrawlerPolicy) async {
+        await updateBot(.aiUser, policy.rawValue)
+    }
+
+    func setAITraining(_ policy: AICrawlerPolicy) async {
+        await updateBot(.aiTraining, policy.rawValue)
+    }
+
+    func setBotPreferenceSync(_ on: Bool) async {
+        await updateBot(.botPreferenceSyncEnabled, on)
+    }
+
+    func setAITrainingRedirect(_ on: Bool) async {
+        guard !isTogglingAITrainingRedirect else { return }
+        isTogglingAITrainingRedirect = true
+        error = nil
+        do {
+            let value = try await service.setSetting(
+                zoneId: zoneId, setting: "redirects_for_ai_training",
+                value: on ? "on" : "off"
+            )
+            aiTrainingRedirect = value == "on"
+        } catch {
+            self.error = error.localizedDescription
+        }
+        isTogglingAITrainingRedirect = false
+    }
+
+    func setMarkdownForAgents(_ on: Bool) async {
+        guard !isTogglingMarkdownForAgents else { return }
+        isTogglingMarkdownForAgents = true
+        error = nil
+        do {
+            let value = try await service.setSetting(
+                zoneId: zoneId, setting: "content_converter",
+                value: on ? "on" : "off"
+            )
+            markdownForAgents = value == "on"
+        } catch {
+            self.error = error.localizedDescription
+        }
+        isTogglingMarkdownForAgents = false
+    }
+
+    func setUnderAttack(_ on: Bool) async {
+        guard !isTogglingUnderAttack else { return }
+        isTogglingUnderAttack = true
+        error = nil
+        do {
+            // 关闭时恢复为 medium（Cloudflare 默认安全级别；API 不记录开启前的旧值）
+            let value = try await service.setSetting(
+                zoneId: zoneId, setting: "security_level",
+                value: on ? "under_attack" : "medium"
+            )
+            underAttack = value == "under_attack"
+        } catch {
+            self.error = error.localizedDescription
+        }
+        isTogglingUnderAttack = false
+    }
+
+    func setDevMode(_ on: Bool) async {
+        guard !isTogglingDevMode else { return }
+        isTogglingDevMode = true
+        error = nil
+        do {
+            let value = try await service.setSetting(
+                zoneId: zoneId, setting: "development_mode",
+                value: on ? "on" : "off"
+            )
+            devMode = value == "on"
+        } catch {
+            self.error = error.localizedDescription
+        }
+        isTogglingDevMode = false
+    }
+
+    /// 校准暂停态（只需 zone.read，与 loadSettings 的 zone-settings.read 无关）。
+    /// 返回最新值，调用方据此回写本地缓存；读失败保持缓存值不动。
+    @discardableResult
+    func refreshPaused() async -> Bool? {
+        guard let zone = try? await zoneService.getZone(zoneId: zoneId) else { return nil }
+        paused = zone.paused ?? false
+        return paused
+    }
+
+    /// 暂停 / 恢复 Cloudflare 代理。返回是否成功，供调用方回写缓存。
+    @discardableResult
+    func setPaused(_ on: Bool) async -> Bool {
+        guard !isTogglingPause else { return false }
+        isTogglingPause = true
+        error = nil
+        defer { isTogglingPause = false }
+        do {
+            let zone = try await zoneService.setPaused(zoneId: zoneId, paused: on)
+            // 少数情况下响应不带 paused，按请求值兜底
+            paused = zone.paused ?? on
+            return true
+        } catch {
+            self.error = error.localizedDescription
+            return false
+        }
+    }
+
+    /// 全部缓存：清除（purge）或标记过期（invalidate）。两者同权限（cache.purge）、同限速。
+    func purgeCache(action: CacheClearAction = .purge) async {
+        guard !isPurging else { return }
+        isPurging = true
+        error = nil
+        do {
+            try await service.purgeAllCache(zoneId: zoneId, action: action)
+            signalDone(action)
+        } catch {
+            self.error = error.localizedDescription
+        }
+        isPurging = false
+    }
+
+    /// 按 URL 清理 / 标记过期（单文件，调用方负责限制 ≤ 30 个 URL）
+    func purgeURLs(_ urls: [String], action: CacheClearAction = .purge) async {
+        await runPurge(urls, action) { try await service.purgeFiles(zoneId: zoneId, urls: $0, action: action) }
+    }
+
+    /// 按 URL 前缀清理 / 标记过期（调用方负责限制 ≤ 30 个）
+    func purgePrefixes(_ prefixes: [String], action: CacheClearAction = .purge) async {
+        await runPurge(prefixes, action) { try await service.purgePrefixes(zoneId: zoneId, prefixes: $0, action: action) }
+    }
+
+    /// 按主机名清理 / 标记过期（调用方负责限制 ≤ 30 个）
+    func purgeHosts(_ hosts: [String], action: CacheClearAction = .purge) async {
+        await runPurge(hosts, action) { try await service.purgeHosts(zoneId: zoneId, hosts: $0, action: action) }
+    }
+
+    /// 按 Cache-Tag 清理 / 标记过期（调用方负责限制 ≤ 30 个）
+    func purgeTags(_ tags: [String], action: CacheClearAction = .purge) async {
+        await runPurge(tags, action) { try await service.purgeTags(zoneId: zoneId, tags: $0, action: action) }
+    }
+
+    /// 缓存清理统一执行：去重并发、清空错误、成功按动作翻 didPurge / didInvalidate 触发反馈
+    private func runPurge(
+        _ items: [String],
+        _ action: CacheClearAction,
+        _ op: ([String]) async throws -> Void
+    ) async {
+        guard !isPurging, !items.isEmpty else { return }
+        isPurging = true
+        error = nil
+        do {
+            try await op(items)
+            signalDone(action)
+        } catch {
+            self.error = error.localizedDescription
+        }
+        isPurging = false
+    }
+
+    private func signalDone(_ action: CacheClearAction) {
+        switch action {
+        case .purge:      didPurge.toggle()
+        case .invalidate: didInvalidate.toggle()
+        }
+    }
+}
